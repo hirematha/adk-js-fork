@@ -6,6 +6,7 @@
 
 import {AGENT_CARD_PATH, AgentCard} from '@a2a-js/sdk';
 import {
+  App,
   BaseArtifactService,
   BaseMemoryService,
   BaseSessionService,
@@ -649,6 +650,39 @@ describe('AdkWebServer', () => {
       expect((response.data as Event[])[0].content!.parts![0].text).toBe(
         "Hello user! I'm streaming you events now!",
       );
+    });
+
+    it('should find session in /run when exported App.name differs from route appName', async () => {
+      agentLoader.getAgentFile = (() =>
+        Promise.resolve({
+          load() {
+            return Promise.resolve(
+              new App({name: 'real_name', rootAgent: TEST_AGENT}),
+            );
+          },
+          async [Symbol.asyncDispose](): Promise<void> {
+            return;
+          },
+        })) as unknown as AgentLoader['getAgentFile'];
+
+      await client.post<Session>(
+        '/apps/my_file/users/testUser/sessions/sessionId',
+        {},
+      );
+
+      const response = await client.post<Event[]>('/run', {
+        appName: 'my_file',
+        userId: 'testUser',
+        sessionId: 'sessionId',
+        newMessage: {
+          parts: [{text: 'Hello test agent!'}],
+          role: 'user',
+        },
+      });
+
+      expect(response.status).toBe(200);
+      expect(Array.isArray(response.data)).toBe(true);
+      expect(response.data!.length).toBe(3);
     });
 
     it('should update session state if stateDelta is provided', async () => {
@@ -1445,10 +1479,11 @@ describe('AdkWebServer', () => {
 
   describe('Structure graph', () => {
     /** Points the loader at `agent` for the rest of the test. */
-    function loadInstead(agent: unknown) {
+    function loadInstead(agent: unknown, readme?: string) {
       agentLoader.getAgentFile = (() =>
         Promise.resolve({
           load: () => Promise.resolve(agent),
+          readReadme: () => Promise.resolve(readme),
           async [Symbol.asyncDispose](): Promise<void> {
             return;
           },
@@ -1505,6 +1540,32 @@ describe('AdkWebServer', () => {
         expect(response.data?.root_agent.sub_agents).toEqual([
           expect.objectContaining({name: 'child', description: 'a child'}),
         ]);
+      });
+
+      it('includes the README.md the agent file resolves', async () => {
+        loadInstead(
+          new LlmAgent({name: 'documented'}),
+          '# Sample\n\nWhat it shows.\n',
+        );
+
+        const response = await client.get<{readme?: string}>(
+          '/dev/apps/testApp/build_graph',
+        );
+
+        expect(response.status).toBe(200);
+        expect(response.data?.readme).toBe('# Sample\n\nWhat it shows.\n');
+      });
+
+      it('omits readme when the agent file resolves none', async () => {
+        loadInstead(new LlmAgent({name: 'undocumented'}));
+
+        const response = await client.get<{name: string; readme?: string}>(
+          '/dev/apps/testApp/build_graph',
+        );
+
+        expect(response.status).toBe(200);
+        expect(response.data?.name).toBe('testApp');
+        expect(response.data?.readme).toBeUndefined();
       });
 
       // A workflow keeps its structure in its edges, so a serializer that only
@@ -1705,6 +1766,9 @@ describe('AdkWebServer', () => {
 
         expect(response.status).toBe(200);
         expect(response.data?.name).toBe('testAgent');
+        expect(response.data?.url).toBe(
+          `${a2aServer!.url}/a2a/testApp/jsonrpc`,
+        );
       },
     );
 

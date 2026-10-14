@@ -26,6 +26,7 @@ import {
   ToolConfirmation,
 } from '@google/adk';
 import {FunctionCall} from '@google/genai';
+import {Span, SpanStatusCode} from '@opentelemetry/api';
 import type {MockInstance} from 'vitest';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {z} from 'zod';
@@ -37,6 +38,7 @@ import {
   getLongRunningFunctionCalls,
   mergeParallelFunctionResponseEvents,
 } from '../../src/agents/functions.js';
+import {tracer} from '../../src/telemetry/tracing.js';
 import {logger} from '../../src/utils/logger.js';
 import {Task} from '../../src/utils/task.js';
 
@@ -66,6 +68,16 @@ const errorTool = new FunctionTool({
   execute: async () => {
     throw new Error('tool error message content');
   },
+});
+
+const typedErrorResponseTool = new FunctionTool({
+  name: 'typedErrorResponseTool',
+  description: 'returns a typed tool error response',
+  parameters: z.object({}),
+  execute: async () => ({
+    error: 'sensitive tool error details',
+    errorType: 'MCP_TOOL_ERROR',
+  }),
 });
 
 class ThrowingTool extends BaseTool {
@@ -397,6 +409,88 @@ describe('handleFunctionCallList', () => {
     expect(definedEvent.content!.parts![0].functionResponse!.response).toEqual({
       result: 'onToolErrorCallback executed',
     });
+  });
+
+  it('records a thrown tool error on its execution span', async () => {
+    const executionSpan = {
+      setAttributes: vi.fn(),
+      setAttribute: vi.fn(),
+      setStatus: vi.fn(),
+      recordException: vi.fn(),
+      end: vi.fn(),
+    };
+    vi.spyOn(tracer, 'startActiveSpan').mockImplementation(((
+      _name: string,
+      callback: (span: Span) => unknown,
+    ) =>
+      callback(
+        executionSpan as unknown as Span,
+      )) as typeof tracer.startActiveSpan);
+
+    await handleFunctionCallList({
+      invocationContext,
+      functionCalls: [{...functionCall, name: 'errorTool'}],
+      toolsDict: {errorTool},
+      beforeToolCallbacks: [],
+      afterToolCallbacks: [],
+    });
+
+    expect(executionSpan.recordException).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.stringContaining('tool error message content'),
+      }),
+    );
+    expect(executionSpan.setAttribute).toHaveBeenCalledWith(
+      'error.type',
+      'Error',
+    );
+    expect(executionSpan.setStatus).toHaveBeenCalledWith({
+      code: SpanStatusCode.ERROR,
+      message: 'Error',
+    });
+    expect(executionSpan.end).toHaveBeenCalledOnce();
+    expect(
+      executionSpan.recordException.mock.invocationCallOrder[0],
+    ).toBeLessThan(executionSpan.end.mock.invocationCallOrder[0]);
+    expect(executionSpan.setStatus.mock.invocationCallOrder[0]).toBeLessThan(
+      executionSpan.end.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('records an explicit error type returned by the tool', async () => {
+    const executionSpan = {
+      setAttributes: vi.fn(),
+      setAttribute: vi.fn(),
+      setStatus: vi.fn(),
+      recordException: vi.fn(),
+      end: vi.fn(),
+    };
+    vi.spyOn(tracer, 'startActiveSpan').mockImplementation(((
+      _name: string,
+      callback: (span: Span) => unknown,
+    ) =>
+      callback(
+        executionSpan as unknown as Span,
+      )) as typeof tracer.startActiveSpan);
+
+    await handleFunctionCallList({
+      invocationContext,
+      functionCalls: [{...functionCall, name: 'typedErrorResponseTool'}],
+      toolsDict: {typedErrorResponseTool},
+      beforeToolCallbacks: [],
+      afterToolCallbacks: [],
+    });
+
+    expect(executionSpan.setAttribute).toHaveBeenCalledWith(
+      'error.type',
+      'MCP_TOOL_ERROR',
+    );
+    expect(executionSpan.setStatus).toHaveBeenCalledWith({
+      code: SpanStatusCode.ERROR,
+      message: 'MCP_TOOL_ERROR',
+    });
+    expect(executionSpan.recordException).not.toHaveBeenCalled();
+    expect(executionSpan.end).toHaveBeenCalledOnce();
   });
 
   it('should return error message when error is thrown during tool execution, when no plugin onToolErrorCallback is provided', async () => {
@@ -819,6 +913,155 @@ describe('handleFunctionCallList', () => {
       status: 'pending',
     });
     expect(event!.actions.stateDelta).toEqual({jobStarted: true});
+  });
+
+  it.each([
+    [
+      'object return',
+      new FunctionTool({
+        name: 't',
+        description: 'returns object',
+        execute: async () => ({ok: true}),
+      }),
+      {ok: true},
+    ],
+    [
+      'primitive string return',
+      new FunctionTool({
+        name: 't',
+        description: 'returns string',
+        execute: async () => 'hello',
+      }),
+      {result: 'hello'},
+    ],
+    [
+      'array return',
+      new FunctionTool({
+        name: 't',
+        description: 'returns array',
+        execute: async () => [1, 2],
+      }),
+      {results: [1, 2]},
+    ],
+    [
+      'null return',
+      new FunctionTool({
+        name: 't',
+        description: 'returns null',
+        execute: async () => null,
+      }),
+      {result: null},
+    ],
+    [
+      'thrown Error with no onToolErrorCallback override',
+      new FunctionTool({
+        name: 't',
+        description: 'throws Error',
+        execute: async () => {
+          throw new Error('boom');
+        },
+      }),
+      {error: "Error in tool 't': boom"},
+    ],
+    [
+      'thrown non-Error value',
+      new ThrowingTool('raw failure'),
+      {error: 'raw failure'},
+    ],
+  ])(
+    'normalizes %s to a Record<string, unknown> before plugin and canonical afterToolCallbacks run',
+    async (_label, tool, expectedNormalized) => {
+      let pluginSeen: Record<string, unknown> | undefined;
+      let canonicalSeen: Record<string, unknown> | undefined;
+
+      class InspectingPlugin extends BasePlugin {
+        constructor() {
+          super('inspect');
+        }
+        override async afterToolCallback({
+          result,
+        }: Parameters<BasePlugin['afterToolCallback']>[0]): Promise<
+          Record<string, unknown> | undefined
+        > {
+          // Verify that `'error' in result` never throws TypeError.
+          void ('error' in result);
+          pluginSeen = result;
+          return undefined;
+        }
+      }
+
+      pluginManager.registerPlugin(new InspectingPlugin());
+      const canonicalAfter: SingleAfterToolCallback = async ({response}) => {
+        void ('error' in response);
+        canonicalSeen = response;
+        return undefined;
+      };
+
+      const event = await handleFunctionCallList({
+        invocationContext,
+        functionCalls: [callFor(tool)],
+        toolsDict: {[tool.name]: tool},
+        beforeToolCallbacks: [],
+        afterToolCallbacks: [canonicalAfter],
+      });
+
+      expect(pluginSeen).toStrictEqual(expectedNormalized);
+      expect(canonicalSeen).toStrictEqual(expectedNormalized);
+      expect(
+        event?.content?.parts?.[0].functionResponse?.response,
+      ).toStrictEqual(expectedNormalized);
+    },
+  );
+
+  it('hands afterToolCallback an empty record when a long-running tool returns nullish, while still deferring the event', async () => {
+    let pluginSeen: Record<string, unknown> | undefined;
+    class InspectingPlugin extends BasePlugin {
+      constructor() {
+        super('inspect');
+      }
+      override async afterToolCallback({
+        result,
+      }: Parameters<BasePlugin['afterToolCallback']>[0]): Promise<
+        Record<string, unknown> | undefined
+      > {
+        expect('error' in result).toBe(false);
+        pluginSeen = result;
+        return undefined;
+      }
+    }
+    pluginManager.registerPlugin(new InspectingPlugin());
+
+    const event = await handleFunctionCallList({
+      invocationContext,
+      functionCalls: [callFor(silentLongRunningTool)],
+      toolsDict: {silentLongRunningTool},
+      beforeToolCallbacks: [],
+      afterToolCallbacks: [],
+    });
+
+    expect(pluginSeen).toStrictEqual({});
+    expect(event).toBeNull();
+  });
+
+  it('allows afterToolCallback to override an unhandled tool error response', async () => {
+    const afterToolCallback: SingleAfterToolCallback = async ({response}) => {
+      if ('error' in response) {
+        return {recoveredFrom: response['error']};
+      }
+      return undefined;
+    };
+
+    const event = await handleFunctionCallList({
+      invocationContext,
+      functionCalls: [callFor(errorTool)],
+      toolsDict: {errorTool},
+      beforeToolCallbacks: [],
+      afterToolCallbacks: [afterToolCallback],
+    });
+
+    expect(event?.content?.parts?.[0].functionResponse?.response).toEqual({
+      recoveredFrom: "Error in tool 'errorTool': tool error message content",
+    });
   });
 });
 

@@ -112,13 +112,15 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 });
 
 vi.mock('../../src/utils/agent_loader.js', () => ({
-  AgentLoader: vi.fn().mockImplementation(() => ({
-    listAgents: vi.fn().mockResolvedValue(['agent1']),
-    getAgentFile: vi.fn().mockResolvedValue({
-      getFilePath: vi.fn().mockReturnValue('path/to/agent1.ts'),
-    }),
-    disposeAll: vi.fn().mockResolvedValue(undefined),
-  })),
+  AgentLoader: vi.fn().mockImplementation(function () {
+    return {
+      listAgents: vi.fn().mockResolvedValue(['agent1']),
+      getAgentFile: vi.fn().mockResolvedValue({
+        getFilePath: vi.fn().mockReturnValue('path/to/agent1.ts'),
+      }),
+      disposeAll: vi.fn().mockResolvedValue(undefined),
+    };
+  }),
 }));
 
 vi.mock('../../src/utils/file_utils.js', () => ({
@@ -134,7 +136,7 @@ const mockCreateInternal = vi.fn();
 const mockUpdateInternal = vi.fn();
 const mockGetAgentOperationInternal = vi.fn();
 
-vi.mock('@google-cloud/vertexai/build/src/genai/client.js', () => ({
+vi.mock('@google-cloud/vertexai', () => ({
   Client: class {
     agentEnginesInternal = {
       createInternal: mockCreateInternal,
@@ -183,13 +185,15 @@ describe('deployToAgentEngine', () => {
       },
     });
 
-    (AgentLoader as Mock).mockImplementation(() => ({
-      listAgents: vi.fn().mockResolvedValue(['agent1']),
-      getAgentFile: vi.fn().mockResolvedValue({
-        getFilePath: vi.fn().mockReturnValue('path/to/agent1.ts'),
-      }),
-      disposeAll: vi.fn().mockResolvedValue(undefined),
-    }));
+    (AgentLoader as Mock).mockImplementation(function () {
+      return {
+        listAgents: vi.fn().mockResolvedValue(['agent1']),
+        getAgentFile: vi.fn().mockResolvedValue({
+          getFilePath: vi.fn().mockReturnValue('path/to/agent1.ts'),
+        }),
+        disposeAll: vi.fn().mockResolvedValue(undefined),
+      };
+    });
 
     execMock.mockImplementation((cmd: string, callback: Callback) => {
       if (cmd.includes('config get-value project')) {
@@ -278,6 +282,12 @@ describe('deployToAgentEngine', () => {
         },
       },
     });
+
+    expect(console.info).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'Successfully deployed Reasoning Engine: projects/test-project/locations/us-central1/reasoningEngines/123',
+      ),
+    );
 
     // Verify tempFolder was cleaned up
     let exists = true;
@@ -692,6 +702,11 @@ describe('deployToAgentEngine', () => {
       },
     });
     expect(mockCreateInternal).not.toHaveBeenCalled();
+    expect(console.info).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'Successfully updated Reasoning Engine: projects/test-project/locations/us-central1/reasoningEngines/12345',
+      ),
+    );
   });
 
   it('should update existing Reasoning Engine successfully when full resource name agentEngineId is provided', async () => {
